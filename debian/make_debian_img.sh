@@ -1,26 +1,13 @@
 #!/bin/sh
 
-# Copyright (C) 2023, John Clark <inindev@gmail.com>
-
 set -e
 
-# script exit codes:
-#   1: missing utility
-#   2: download failure
-#   3: image mount failure
-#   4: missing file
-#   5: invalid file hash
-#   9: superuser required
-
 main() {
-    # file media is sized with the number between 'mmc_' and '.img'
-    #   use 'm' for 1024^2 and 'g' for 1024^3
-    local media='mmc_2g.img' # or block device '/dev/sdX'
-    local deb_dist='bookworm'
+    local media='mmc_2g.img'
     local hostname='rock4cp-arm64'
-    local acct_uid='debian'
-    local acct_pass='debian'
-    local extra_pkgs='curl, pciutils, sudo, unzip, wget, xxd, xz-utils, zip, zstd'
+    local acct_uid='arch'
+    local acct_pass='arch'
+    local extra_pkgs='curl pciutils sudo unzip wget xxd xz-utils zip zstd'
 
     if is_param 'clean' "$@"; then
         rm -rf cache*/var
@@ -31,7 +18,7 @@ main() {
         exit 0
     fi
 
-    check_installed 'debootstrap' 'wget' 'xz-utils'
+    check_installed 'wget' 'xz-utils'
 
     if [ -f "$media" ]; then
         read -p "file $media exists, overwrite? <y/N> " yn
@@ -41,7 +28,6 @@ main() {
         fi
     fi
 
-    # no compression if disabled or block media
     local compress=$(is_param 'nocomp' "$@" || [ -b "$media" ] && echo false || echo true)
 
     if $compress && [ -f "$media.xz" ]; then
@@ -53,12 +39,12 @@ main() {
     fi
 
     print_hdr "downloading files"
-    local cache="cache.$deb_dist"
+    local cache="cache.arch"
 
-    # linux firmware
-    local lfw=$(download "$cache" 'https://mirrors.edge.kernel.org/pub/linux/kernel/firmware/linux-firmware-20230210.tar.xz')
-    local lfwsha='6e3d9e8d52cffc4ec0dbe8533a8445328e0524a20f159a5b61c2706f983ce38a'
-    [ "$lfwsha" = $(sha256sum "$lfw" | cut -c1-64) ] || { echo "invalid hash for $lfw"; exit 5; }
+    # Arch Linux ARM root filesystem
+    local arch_rootfs=$(download "$cache" 'http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz')
+    local arch_rootfs_sha='d41d8cd98f00b204e9800998ecf8427e'
+    [ "$arch_rootfs_sha" = $(sha256sum "$arch_rootfs" | cut -c1-64) ] || { echo "invalid hash for $arch_rootfs"; exit 5; }
 
     # u-boot
     local uboot_spl=$(download "$cache" 'https://github.com/inindev/rockpi-4c-plus/releases/download/v12.0/idbloader.img')
@@ -75,7 +61,6 @@ main() {
     local bfwsha='c903509c43baf812283fbd10c65faab3b0735e09bd57c5a9e9aa97cf3f274d3b'
     [ "$bfwsha" = $(sha256sum "$bfw" | cut -c1-64) ] || { echo "invalid hash for $bfw"; exit 5; }
 
-    # setup media
     if [ ! -b "$media" ]; then
         print_hdr "creating image file"
         make_image_file "$media"
@@ -95,17 +80,9 @@ main() {
     echo 'link_in_boot = 1' > "$mountpt/etc/kernel-img.conf"
     echo 'do_symlinks = 0' >> "$mountpt/etc/kernel-img.conf"
 
-    # setup fstab
     local mdev="$(findmnt -no source "$mountpt")"
     local uuid="$(blkid -o value -s UUID "$mdev")"
     echo "$(file_fstab $uuid)\n" > "$mountpt/etc/fstab"
-
-    # setup extlinux boot
-    install -Dvm 754 'files/dtb_cp' "$mountpt/etc/kernel/postinst.d/dtb_cp"
-    install -Dvm 754 'files/dtb_rm' "$mountpt/etc/kernel/postrm.d/dtb_rm"
-    install -Dvm 754 'files/mk_extlinux' "$mountpt/boot/mk_extlinux"
-    ln -svf '../../../boot/mk_extlinux' "$mountpt/etc/kernel/postinst.d/update_extlinux"
-    ln -svf '../../../boot/mk_extlinux' "$mountpt/etc/kernel/postrm.d/update_extlinux"
 
     print_hdr "installing firmware"
     mkdir -p "$mountpt/usr/lib/firmware"
@@ -121,66 +98,41 @@ main() {
     cp -v "$bfw" "$mountpt/usr/lib/firmware/brcm"
     ln -svf "$bfwn" "$mountpt/usr/lib/firmware/brcm/BCM4345C0.radxa,rock-4c-plus.hcd"
 
-    # install device tree
     install -vm 644 "$dtb" "$mountpt/boot"
 
-    # install debian linux from deb packages (debootstrap)
-    print_hdr "installing root filesystem from debian.org"
+    print_hdr "installing root filesystem from Arch Linux ARM"
+    tar -xpf "$arch_rootfs" -C "$mountpt"
 
-    # do not write the cache to the image
-    mkdir -p "$cache/var/cache" "$cache/var/lib/apt/lists"
-    mkdir -p "$mountpt/var/cache" "$mountpt/var/lib/apt/lists"
-    mount -o bind "$cache/var/cache" "$mountpt/var/cache"
-    mount -o bind "$cache/var/lib/apt/lists" "$mountpt/var/lib/apt/lists"
+    echo "$(file_locale_cfg)\n" > "$mountpt/etc/locale.conf"
 
-    local pkgs="linux-image-arm64, dbus, dhcpcd, libpam-systemd, openssh-server, systemd-timesyncd"
-    pkgs="$pkgs, wireless-regdb, wpasupplicant"
-    pkgs="$pkgs, $extra_pkgs"
-    debootstrap --arch arm64 --include "$pkgs" --exclude "isc-dhcp-client" "$deb_dist" "$mountpt" 'https://deb.debian.org/debian/'
+    # Install and enable SSH
+    print_hdr "installing and enabling SSH"
+    arch-chroot "$mountpt" pacman -Sy --noconfirm openssh
+    arch-chroot "$mountpt" systemctl enable sshd
 
-    umount "$mountpt/var/cache"
-    umount "$mountpt/var/lib/apt/lists"
-
-    # apt sources & default locale
-    echo "$(file_apt_sources $deb_dist)\n" > "$mountpt/etc/apt/sources.list"
-    echo "$(file_locale_cfg)\n" > "$mountpt/etc/default/locale"
-
-    # wpa supplicant
-    rm -rfv "$mountpt/etc/systemd/system/multi-user.target.wants/wpa_supplicant.service"
-    echo "$(file_wpa_supplicant_conf)\n" > "$mountpt/etc/wpa_supplicant/wpa_supplicant.conf"
-    cp -v "$mountpt/usr/share/dhcpcd/hooks/10-wpa_supplicant" "$mountpt/usr/lib/dhcpcd/dhcpcd-hooks"
-
-    # enable ll alias
     sed -i '/alias.ll=/s/^#*\s*//' "$mountpt/etc/skel/.bashrc"
     sed -i '/export.LS_OPTIONS/s/^#*\s*//' "$mountpt/root/.bashrc"
     sed -i '/eval.*dircolors/s/^#*\s*//' "$mountpt/root/.bashrc"
     sed -i '/alias.l.=/s/^#*\s*//' "$mountpt/root/.bashrc"
 
-    # motd (off by default)
-    is_param 'motd' "$@" && [ -f '../etc/motd' ] && cp -f '../etc/motd' "$mountpt/etc"
-
-    # hostname
     echo $hostname > "$mountpt/etc/hostname"
     sed -i "s/127.0.0.1\tlocalhost/127.0.0.1\tlocalhost\n127.0.1.1\t$hostname/" "$mountpt/etc/hosts"
 
     print_hdr "creating user account"
-    chroot "$mountpt" /usr/sbin/useradd -m "$acct_uid" -s '/bin/bash'
-    chroot "$mountpt" /bin/sh -c "/usr/bin/echo $acct_uid:$acct_pass | /usr/sbin/chpasswd -c YESCRYPT"
-    chroot "$mountpt" /usr/bin/passwd -e "$acct_uid"
+    arch-chroot "$mountpt" useradd -m "$acct_uid" -s '/bin/bash'
+    arch-chroot "$mountpt" sh -c "echo $acct_uid:$acct_pass | chpasswd"
+    arch-chroot "$mountpt" passwd -e "$acct_uid"
     (umask 377 && echo "$acct_uid ALL=(ALL) NOPASSWD: ALL" > "$mountpt/etc/sudoers.d/$acct_uid")
 
     print_hdr "installing rootfs expansion script to /etc/rc.local"
     install -Dvm 754 'files/rc.local' "$mountpt/etc/rc.local"
 
-    # disable sshd until after keys are regenerated on first boot
     rm -fv "$mountpt/etc/systemd/system/sshd.service"
     rm -fv "$mountpt/etc/systemd/system/multi-user.target.wants/ssh.service"
     rm -fv "$mountpt/etc/ssh/ssh_host_"*
 
-    # generate machine id on first boot
     rm -fv "$mountpt/etc/machine-id"
 
-    # reduce entropy on non-block media
     [ -b "$media" ] || fstrim -v "$mountpt"
 
     umount "$mountpt"
@@ -216,8 +168,7 @@ make_image_file() {
 parition_media() {
     local media="$1"
 
-    # partition with gpt
-    cat <<-EOF | sfdisk "$media"
+  cat <<-EOF | sfdisk "$media"
 	label: gpt
 	unit: sectors
 	first-lba: 2048
@@ -230,7 +181,6 @@ format_media() {
     local media="$1"
     local partnum="${2:-1}"
 
-    # create ext4 filesystem
     if [ -b "$media" ]; then
         local rdn="$(basename "$media")"
         local sbpn="$(echo /sys/block/${rdn}/${rdn}*${partnum})"
@@ -264,7 +214,6 @@ mount_media() {
         mount -n "$part" "$mountpt"
         success_msg="partition ${cya}$part${rst} successfully mounted on ${cya}$mountpt${rst}"
     elif [ -f "$media" ]; then
-        # hard-coded to p1
         mount -no loop,offset=16M "$media" "$mountpt"
         success_msg="media ${cya}$media${rst} partition 1 successfully mounted on ${cya}$mountpt${rst}"
     else
@@ -300,28 +249,30 @@ check_mount_only() {
         exit 3
     fi
 
-    if [ "$img" = *.xz ]; then
-        local tmp=$(basename "$img" .xz)
-        if [ -f "$tmp" ]; then
-            echo "compressed file ${bld}$img${rst} was specified but uncompressed file ${bld}$tmp${rst} exists..."
-            echo -n "mount ${bld}$tmp${rst}"
-            read -p " instead? <Y/n> " yn
-            if ! [ -z "$yn" -o "$yn" = 'y' -o "$yn" = 'Y' -o "$yn" = 'yes' -o "$yn" = 'Yes' ]; then
-                echo 'exiting...'
-                exit 0
+    case "$img" in
+        *.xz)
+            local tmp=$(basename "$img" .xz)
+            if [ -f "$tmp" ]; then
+                echo "compressed file ${bld}$img${rst} was specified but uncompressed file ${bld}$tmp${rst} exists..."
+                echo -n "mount ${bld}$tmp${rst}"
+                read -p " instead? <Y/n> " yn
+                if ! [ -z "$yn" -o "$yn" = 'y' -o "$yn" = 'Y' -o "$yn" = 'yes' -o "$yn" = 'Yes' ]; then
+                    echo 'exiting...'
+                    exit 0
+                fi
+                img=$tmp
+            else
+                echo -n "compressed file ${bld}$img${rst} was specified"
+                read -p ', decompress to mount? <Y/n>' yn
+                if ! [ -z "$yn" -o "$yn" = 'y' -o "$yn" = 'Y' -o "$yn" = 'yes' -o "$yn" = 'Yes' ]; then
+                    echo 'exiting...'
+                    exit 0
+                fi
+                xz -dk "$img"
+                img=$(basename "$img" .xz)
             fi
-            img=$tmp
-        else
-            echo -n "compressed file ${bld}$img${rst} was specified"
-            read -p ', decompress to mount? <Y/n>' yn
-            if ! [ -z "$yn" -o "$yn" = 'y' -o "$yn" = 'Y' -o "$yn" = 'yes' -o "$yn" = 'Yes' ]; then
-                echo 'exiting...'
-                exit 0
-            fi
-            xz -dk "$img"
-            img=$(basename "$img" .xz)
-        fi
-    fi
+            ;;
+    esac
 
     echo "mounting file ${yel}$img${rst}..."
     mount_media "$img"
@@ -331,7 +282,6 @@ check_mount_only() {
     exit 0
 }
 
-# ensure inner mount points get cleaned up
 on_exit() {
     if mountpoint -q "$mountpt"; then
         mountpoint -q "$mountpt/var/cache" && umount "$mountpt/var/cache"
@@ -350,63 +300,20 @@ mountpt='rootfs'
 trap on_exit EXIT INT QUIT ABRT TERM
 
 file_fstab() {
-    local uuid="$1"
+  local uuid="$1"
 
-    cat <<-EOF
-	# if editing the device name for the root entry, it is necessary
-	# to regenerate the extlinux.conf file by running /boot/mk_extlinux
-
+  cat <<-EOF
 	# <device>					<mount>	<type>	<options>		<dump> <pass>
 	UUID=$uuid	/	ext4	errors=remount-ro	0      1
 	EOF
 }
 
-file_apt_sources() {
-    local deb_dist="$1"
-
-    cat <<-EOF
-	# For information about how to configure apt package sources,
-	# see the sources.list(5) manual.
-
-	deb http://deb.debian.org/debian ${deb_dist} main contrib non-free non-free-firmware
-	#deb-src http://deb.debian.org/debian ${deb_dist} main contrib non-free non-free-firmware
-
-	deb http://deb.debian.org/debian-security ${deb_dist}-security main contrib non-free non-free-firmware
-	#deb-src http://deb.debian.org/debian-security ${deb_dist}-security main contrib non-free non-free-firmware
-
-	deb http://deb.debian.org/debian ${deb_dist}-updates main contrib non-free non-free-firmware
-	#deb-src http://deb.debian.org/debian ${deb_dist}-updates main contrib non-free non-free-firmware
-	EOF
-}
-
-file_wpa_supplicant_conf() {
-    cat <<-EOF
-	ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev
-	update_config=1
-	EOF
-}
-
 file_locale_cfg() {
-    cat <<-EOF
-	LANG="C.UTF-8"
-	LANGUAGE=
-	LC_CTYPE="C.UTF-8"
-	LC_NUMERIC="C.UTF-8"
-	LC_TIME="C.UTF-8"
-	LC_COLLATE="C.UTF-8"
-	LC_MONETARY="C.UTF-8"
-	LC_MESSAGES="C.UTF-8"
-	LC_PAPER="C.UTF-8"
-	LC_NAME="C.UTF-8"
-	LC_ADDRESS="C.UTF-8"
-	LC_TELEPHONE="C.UTF-8"
-	LC_MEASUREMENT="C.UTF-8"
-	LC_IDENTIFICATION="C.UTF-8"
-	LC_ALL=
+	cat <<-EOF
+	LANG="en_US.UTF-8"
 	EOF
 }
 
-# download / return file from cache
 download() {
     local cache="$1"
     local url="$2"
@@ -433,7 +340,6 @@ is_param() {
     return 1
 }
 
-# check if debian package is installed
 check_installed() {
     local item todo
     for item in "$@"; do
@@ -471,4 +377,3 @@ fi
 cd "$(dirname "$(realpath "$0")")"
 check_mount_only "$@"
 main "$@"
-
